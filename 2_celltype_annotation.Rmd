@@ -1,0 +1,864 @@
+# celltype annotation
+```{r setup}
+# ---- List of packages required
+depp <- c(
+  "languageserver", "httpgd", "Seurat", "DoubletFinder", "dplyr", "DT",
+  "ggplot2", "patchwork", "data.table", "tidyr", "tidyverse", "tidygraph",
+  "ggraph", "SeuratWrappers", "doParallel", "openxlsx", "viridis", "rstatix"
+)
+# ---- Check if the packages were installed if not install
+depp_new <- depp[!(depp %in% installed.packages())]
+if (length(depp_new)) {
+  install.packages(depp_new)
+}
+# remotes::install_github('satijalab/seurat-wrappers')
+# remotes::install_github('chris-mcginnis-ucsf/DoubletFinder')
+
+# ---- List of bioconductor packages required by this analysis
+BioDepp <- c(
+  "scater", "slingshot", "destiny", "ggrepel",
+  "GSEABase", "ggpubr", "org.Hs.eg.db", "clusterProfiler"
+)
+# ---- Check if the packages were installed if not install
+BioDepp_new <- BioDepp[!(BioDepp %in% installed.packages())]
+# install.packages("BiocManager")
+if (length(BioDepp_new)) {
+  BiocManager::install(BioDepp_new)
+}
+
+# ---- load required packages
+sapply(depp, library, character.only = TRUE)
+sapply(BioDepp, library, character.only = TRUE)
+```
+
+
+
+
+
+# SingleR annotation
+```{r PDAC reference dataset}
+# sample.integrated <- readRDS("../analysis/sample_integrated_sap_pdac_pc30.rds")
+
+# ---- singleR celltype annotation
+library(scuttle)
+bp.se <- readRDS("~/reference/singleR/BlueprintEncodeData.rds")
+hpca.se <- readRDS("~/reference/singleR/HumanPrimaryCellAtlasData.rds")
+
+sample.integrated.sce <- seu2sce(sample.integrated)
+table(colSums(counts(sample.integrated.sce)) > 0)
+# sample.integrated.sce <- sample.integrated.sce[,colSums(counts(sample.integrated.sce)) > 0]
+sample.integrated.sce <- logNormCounts(sample.integrated.sce)
+pred.sap <- SingleR(
+  test = sample.integrated.sce,
+  # de.method = "wilcox",
+  ref = list(BPE = bp.se, HPCA = hpca.se),
+  labels = list(bp.se$label.main, hpca.se$label.main)
+)
+head(pred.sap)
+table(pred.sap$labels)
+save(pred.sap, file = "sap_pdac_anno_singleR.rda")
+```
+
+```{r annotation based on singleR}
+table(rownames(pred.sap) %in% colnames(sample.integrated))
+sample.integrated$celltype_singleR <- pred.sap$labels
+pdf("umap_integrated_singleR_celltype.pdf", width = 12, height = 6)
+print(
+  DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "celltype_singleR", raster = FALSE)
+)
+print(
+  DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "celltype", raster = FALSE)
+)
+dev.off()
+
+# ---- cell type distribution under singleR
+table(sample.integrated$celltype_singleR, sample.integrated$integrated_snn_res.3)
+pdf("umap_integrated_singleR_celltype.pdf", width = 7, height = 6)
+Idents(sample.integrated) <- "integrated_snn_res.3"
+for (i in unique(sample.integrated$celltype_singleR)) {
+  cell_names <- colnames(sample.integrated)[sample.integrated$celltype_singleR == i]
+  print(
+    DimPlot(
+      object = sample.integrated, cells.highlight = cell_names,
+      cols.highlight = "red", cols = "gray", pt.size = 0.1, order = TRUE, label = T
+    ) + labs(title = i)
+  )
+}
+dev.off()
+
+# ---- cluster distribution under res3
+pdf("umap_integrated_cluster_res3.pdf", width = 7, height = 6)
+Idents(sample.integrated) <- "integrated_snn_res.3"
+for (i in sort(unique(sample.integrated$integrated_snn_res.3))) {
+  cell_names <- colnames(sample.integrated)[sample.integrated$integrated_snn_res.3 == i]
+  print(
+    DimPlot(
+      object = sample.integrated, cells.highlight = cell_names,
+      cols.highlight = "red", cols = "gray", pt.size = 0.1, order = TRUE, label = T
+    ) + labs(title = i)
+  )
+}
+dev.off()
+
+sum.df <- sample.integrated@meta.data %>%
+  dplyr::group_by(integrated_snn_res.3) %>%
+  dplyr::summarise(num = n(), gene = mean(nFeature_RNA), count = mean(nCount_RNA), mt = mean(percent.mt))
+dbl.df <- as.data.frame(table(sample.integrated$integrated_snn_res.3, sample.integrated$scrublet_callrate)) %>%
+  group_by(Var1) %>%
+  mutate(doublet_rate = Freq / sum(Freq))
+sum.df$dbl_rate <- dbl.df[dbl.df$Var2 == "Doublet", "doublet_rate"]
+
+print(sum.df %>% arrange(gene), n = 80)
+print(sum.df %>% arrange(count), n = 80)
+print(sum.df %>% arrange(mt), n = 80)
+print(sum.df %>% arrange(-dbl_rate$doublet_rate), n = 80)
+print(sum.df %>% arrange(dbl_rate$doublet_rate, gene, count), n = 80)
+```
+
+
+
+
+
+# check marker gene expression
+```{r marker gene}
+DefaultAssay(sample.integrated) <- "RNA"
+Idents(sample.integrated) <- "integrated_snn_res.3"
+plan("multicore", workers = 4)
+markers.all <- FindAllMarkers(
+  sample.integrated,
+  # test.use = "MAST",
+  # latent.vars = c("nCount_RNA", "percent.mt")
+  assay = "RNA",
+  logfc.threshold = 0.5,
+  only.pos = TRUE
+)
+write.xlsx(markers.all, file = "../../result/sample.integrated_AllMarker_res3.xlsx", colNames = T)
+```
+
+
+
+
+
+# Remove low quality clusters and re-run clustering
+```{r find RBC cluster}
+Idents(sample.integrated) <- "integrated_snn_res.3"
+gene.avg <- AverageExpression(sample.integrated, slot = "data", assay = "RNA", group.by = "ident")$RNA
+```
+
+```{r remove dbl}
+# ---- remove clusters
+Idents(sample.integrated) <- "integrated_snn_res.3"
+sample.integrated.rdb <- subset(
+  sample.integrated,
+  idents = c(
+    "0_9", "0_11", "21_6", "34_5", "36_2", "45_0", "45_4",
+    "46_0", "46_3", "47_2", "47_4", "49_0", "49_4", "61_0", "61_2", 66,
+    "69_2"
+  ),
+  invert = T
+)
+DefaultAssay(sample.integrated.rdb) <- "integrated"
+sample.integrated.rdb <- RunUMAP(sample.integrated.rdb, umap.method = "umap-learn", reduction = "pca", dims = 1:30)
+sample.integrated.rdb <- FindNeighbors(sample.integrated.rdb, reduction = "pca", dims = 1:30, force.recalc = T)
+sample.integrated.rdb <- FindClusters(sample.integrated.rdb, algorithm = 1, resolution = seq(0.1, 3, 0.1))
+saveRDS(sample.integrated.rdb, file = "sample_integrated_sap_pdac_rdb.rds")
+
+head(sample.integrated.rdb@meta.data)
+pdf("../../figures/02_integrated_rdb/umap_integrated_sap_pdac_rdb_metadata.pdf", width = 10, height = 8)
+# print(DimPlot(object = sample.integrated.rdb, reduction = "umap", label = T, group.by = "celltype") + NoLegend())
+print(DimPlot(object = sample.integrated.rdb, reduction = "umap", label = T, group.by = "celltype_singleR") + NoLegend())
+print(DimPlot(object = sample.integrated.rdb, reduction = "umap", label = T, group.by = "integrated_snn_res.0.1"))
+print(DimPlot(object = sample.integrated.rdb, reduction = "umap", label = T, group.by = "integrated_snn_res.0.2"))
+print(DimPlot(object = sample.integrated.rdb, reduction = "umap", label = T, group.by = "integrated_snn_res.0.4"))
+print(DimPlot(object = sample.integrated.rdb, reduction = "umap", label = T, group.by = "integrated_snn_res.0.8"))
+print(DimPlot(object = sample.integrated.rdb, reduction = "umap", label = T, group.by = "integrated_snn_res.1.2"))
+print(DimPlot(object = sample.integrated.rdb, reduction = "umap", label = T, group.by = "integrated_snn_res.1.6"))
+print(DimPlot(object = sample.integrated.rdb, reduction = "umap", label = T, group.by = "integrated_snn_res.2"))
+print(DimPlot(object = sample.integrated.rdb, reduction = "umap", label = T, group.by = "integrated_snn_res.2.5"))
+print(DimPlot(object = sample.integrated.rdb, reduction = "umap", label = T, group.by = "integrated_snn_res.3"))
+print(DimPlot(object = sample.integrated.rdb, reduction = "umap", label = T, group.by = "Patient"))
+print(DimPlot(object = sample.integrated.rdb, reduction = "umap", label = T, group.by = "Group"))
+print(DimPlot(object = sample.integrated.rdb, reduction = "umap", label = T, group.by = "Phase"))
+print(DimPlot(object = sample.integrated.rdb, reduction = "umap", label = T, group.by = "Cause"))
+print(DimPlot(object = sample.integrated.rdb, reduction = "umap", label = T, group.by = "scrublet_callrate"))
+dev.off()
+
+pdf("../../figures/02_integrated_rdb/umap_integrated_sap_pdac_rdb_cluster_res3.pdf", width = 7, height = 6)
+Idents(sample.integrated.rdb) <- "integrated_snn_res.3"
+for (i in sort(unique(sample.integrated.rdb$integrated_snn_res.3))) {
+  cell_names <- colnames(sample.integrated.rdb)[sample.integrated.rdb$integrated_snn_res.3 == i]
+  print(
+    DimPlot(
+      object = sample.integrated.rdb, cells.highlight = cell_names,
+      cols.highlight = "red", cols = "gray", pt.size = 0.1, order = TRUE, label = T
+    ) + labs(title = i)
+  )
+}
+dev.off()
+```
+
+```{r marker gene featureplot}
+# sample.integrated <- readRDS("../analysis/sample_integrated_sap_pdac_rdb.rds")
+pdf("../../figures/02_integrated_rdb/umap_integrated_sap_pdac_rdb_feature.pdf", width = 8, height = 7)
+DefaultAssay(sample.integrated.rdb) <- "RNA"
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "G2M.Score"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("MKI67", "HBA1", "HBA2", "HBB"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("CD3D", "CD4", "SLC4A10", "GZMB"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("CD8A", "CD8B", "GZMA", "GZMK"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("IL7R", "CD27", "CCR7"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("CD4", "FOXP3", "CD27"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("GNLY", "GZMA", "TRDC", "GZMB"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("FGFBP2", "FCG3RA", "GZMK", "CX3CR1"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("GNLY", "NKG7", "TYOBP", "PRF1"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("CD19", "CD79A", "CD79B", "MS4A1"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("CD79A", "TCL1A", "IGHA1", "MZB1"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("JCHAIN", "CD79A", "PF4", "FOXP3"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("IGHG1", "MZB1", "IGHA1", "CD79A"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("CD14", "CST3", "CFP", "STAB1"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("TCF7L2", "KLF3", "IKZF1", "FLI1"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("CEBPD", "ZFP36L2", "CD16", "S100A12"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("CD68", "CD163", "STAB1", "AIF1"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("MT1G", "KLF4", "FOLR2", "CREM"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("HES1", "REL", "BTG2", "CEBPD"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("MAFB", "ATF3", "MAF", "FCGR3A"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("MEF2A", "PA2G4", "MAF", "HIF1A"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("CST3", "LYZ", "FCGR3B", "CSF3R"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("ACTA2", "RGS5", "MYH11", "BGN"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("FGF7", "MME", "MYH11", "LUM"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("GJA5", "IGFBP3", "CA4", "SELP"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("ACKR1", "ESM1", "CLDN5", "PROX1"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("FCER1A", "FCER2", "PBX1"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("CST3", "KIT", "CPA3"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("GZMB", "JCHAIN", "TCL1A", "LILRA4"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("CLEC10A", "HMGA1", "PFDN1", "IRF4"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("CLEC9A", "BATF3", "ID2", "CD1C"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("ADIRF", "RGS5", "MYL9", "CCL19"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("ACTA2", "MYH11", "ACTG2", "CNN1"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("PRSS1", "CPB1", "CLPS", "CTRB1"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("CELA3A", "CPA1", "AMY2A", "RAMP2"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("FXYD2", "SLC4A4", "CLU", "LEFTY1"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("ANXA4", "AMBP", "CLDN10", "DEFB1"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("MMP7", "TSPAN8", "SOX9", "LCN2"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("TFF1", "FXYD3", "TFF2", "C19orf33"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+print(
+  FeaturePlot(
+    object = sample.integrated.rdb,
+    features = c("TFF3", "KRT19", "REG3A", "REG4"),
+    cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+  )
+)
+print(FeaturePlot(
+  object = sample.integrated.rdb,
+  features = c("TFF2", "CEACAM1", "CEACAM5", "CEACAM6"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+))
+DefaultAssay(sample.integrated.rdb) <- "integrated"
+dev.off()
+```
+
+```{r marker gene under res3}
+sum.df <- sample.integrated.rdb@meta.data %>%
+  dplyr::group_by(integrated_snn_res.3) %>%
+  dplyr::summarise(num = n(), gene = mean(nFeature_RNA), count = mean(nCount_RNA), mt = mean(percent.mt))
+print(sum.df %>% arrange(gene, count), n = 80)
+dbl.df <- as.data.frame(table(sample.integrated.rdb$integrated_snn_res.3, sample.integrated.rdb$scrublet_callrate)) %>%
+  group_by(Var1) %>%
+  mutate(doublet_rate = Freq / sum(Freq))
+sum.df$dbl_rate <- dbl.df[dbl.df$Var2 == "Doublet", "doublet_rate"]
+print(sum.df %>% arrange(dbl_rate$doublet_rate, gene, count), n = 80)
+
+# ---- all marker genes
+DefaultAssay(sample.integrated.rdb) <- "RNA"
+Idents(sample.integrated.rdb) <- "integrated_snn_res.3"
+plan("multicore", workers = 4)
+markers.all <- FindAllMarkers(
+  sample.integrated.rdb,
+  # test.use = "MAST",
+  # latent.vars = c("nCount_RNA", "percent.mt"),
+  assay = "RNA",
+  logfc.threshold = 0.5,
+  only.pos = TRUE
+)
+write.xlsx(markers.all, file = "../result/sample_integrated_rdb_AllMarker_res3.xlsx", colNames = T)
+
+# ---- individual marker genes
+markers.c48 <- FindMarkers(
+  sample.integrated.rdb,
+  ident.1 = 48,
+  group.by = "integrated_snn_res.3",
+  assay = "RNA",
+  logfc.threshold = 0.5,
+  only.pos = TRUE
+)
+markers.c48 %>%
+  filter(p_val_adj < 0.05) %>%
+  arrange(avg_log2FC)
+```
+
+```{r rbl annotation}
+sample.integrated.rdb$celltype <- "unknown"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 0] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 1] <- "Ductal_1"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 10] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 11] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 12] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 13] <- "Ductal_1"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 14] <- "Ductal_1"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 15] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 16] <- "Ductal_1"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 17] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 18] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 19] <- "Ductal_1"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 2] <- "Ductal_1"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 20] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 21] <- "Endothelial"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 22] <- "Macrophages"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 23] <- "Endothelial"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 24] <- "Monocytes"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 25] <- "Fibroblast"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 26] <- "CD4T"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 27] <- "Stellate"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 28] <- "Ductal_1"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 29] <- "Neutrophils"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 3] <- "Ductal_1"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 30] <- "Endothelial"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 31] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 32] <- "Macrophages"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 33] <- "Fibroblast"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 34] <- "SMC"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 35] <- "Ductal_1"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 36] <- "CD4T"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 37] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 38] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 39] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 4] <- "CD8T"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 40] <- "Macrophages"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 41] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 42] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 43] <- "NK"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 44] <- "Fibroblast"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 45] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 46] <- "Endothelial"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 47] <- "Plasma"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 48] <- "dbl"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 49] <- "Ductal_2"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 5] <- "Ductal_1"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 50] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 51] <- "Endocrine"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 52] <- "Macrophages"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 53] <- "DC"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 54] <- "Endothelial"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 55] <- "CD4T"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 56] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 57] <- "Fibroblast"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 58] <- "Ductal_2"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 59] <- "Ductal_2"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 6] <- "Ductal_1"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 60] <- "Stellate"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 61] <- "MAST"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 62] <- "Bcell"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 63] <- "dbl"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 64] <- "Fibroblast"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 65] <- "dbl"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 66] <- "dbl"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 67] <- "Acinar"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 68] <- "Fibroblast"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 69] <- "Endothelial"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 7] <- "Endothelial"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 70] <- "dbl"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 71] <- "CD4T"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 72] <- "dbl"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 8] <- "Endothelial"
+sample.integrated.rdb$celltype[sample.integrated.rdb$integrated_snn_res.3 == 9] <- "Endothelial"
+
+# saveRDS(sample.integrated.rdb, file = "sample_integrated_sap_pdac_rdb.rds")
+```
+
+
+# 2nd round remove low quality cells
+```{r second round for removing cells}
+sample.integrated.rdb <- readRDS("sample_integrated_sap_pdac_rdb.rds")
+table(sample.integrated.rdb$integrated_snn_res.3, sample.integrated.rdb$celltype)
+
+# ---- remove cells and re-run clustering
+sample.integrated.rlq <- subset(sample.integrated.rdb, subset = celltype %in% "dbl", invert = T)
+# sample.integrated.rlq <- subset(sample.integrated.rlq, subset = celltype %in% "dbl", invert = T)
+DefaultAssay(sample.integrated.rlq) <- "integrated"
+sample.integrated.rlq <- RunUMAP(sample.integrated.rlq, umap.method = "umap-learn", reduction = "pca", dims = 1:30)
+sample.integrated.rlq <- FindNeighbors(sample.integrated.rlq, reduction = "pca", dims = 1:30, force.recalc = T)
+sample.integrated.rlq <- FindClusters(sample.integrated.rlq, algorithm = 1, resolution = seq(0.1, 3, 0.1))
+saveRDS(sample.integrated.rlq, file = "sample_integrated_sap_pdac_rlq.rds")
+```
+
+```{r marker gene}
+DefaultAssay(sample.integrated.rlq) <- "RNA"
+Idents(sample.integrated.rlq) <- "integrated_snn_res.3"
+plan("multicore", workers = 4)
+markers.all <- FindAllMarkers(
+  sample.integrated.rlq,
+  test.use = "MAST",
+  latent.vars = c("nCount_RNA", "percent.mt"),
+  assay = "RNA",
+  logfc.threshold = 0.5,
+  only.pos = TRUE
+)
+write.xlsx(markers.all, file = "../../result/sample_integrated_rlq_AllMarker_res3.xlsx", colNames = T)
+
+# ---- individual marker genes
+markers.c50 <- FindMarkers(
+  sample.integrated.rdb,
+  ident.1 = 39,
+  group.by = "integrated_snn_res.3",
+  assay = "RNA",
+  logfc.threshold = 1,
+  only.pos = TRUE
+)
+markers.c50 %>%
+  filter(p_val_adj < 0.05) %>%
+  arrange(avg_log2FC) %>%
+  rownames_to_column() %>%
+  filter(rowname == "IFI27")
+```
+
+```{r marker gene featureplot}
+pdf("umap_integrated_sap_pdac_rlq_metadata.pdf", width = 12, height = 6)
+print(
+  DimPlot(object = sample.integrated.rlq, reduction = "umap", label = T, group.by = "Batch", raster = FALSE)
+)
+print(
+  DimPlot(object = sample.integrated.rlq, reduction = "umap", label = T, group.by = "Patient", raster = FALSE)
+)
+dev.off()
+```
+
+```{r annotation visuzlization}
+# ---- annotation based on PDAC and singleR datasets
+pdf("umap_integrated_sap_pdac_rlq_singleR_celltype.pdf", width = 8, height = 6)
+print(
+  DimPlot(object = sample.integrated.rlq, reduction = "umap", label = T, group.by = "celltype", raster = FALSE)
+)
+print(
+  DimPlot(object = sample.integrated.rlq, reduction = "umap", label = T, group.by = "celltype_singleR", raster = FALSE) +
+    NoLegend()
+)
+dev.off()
+
+# ---- cell type distribution under singleR
+table(sample.integrated.rlq$integrated_snn_res.3, sample.integrated.rlq$celltype)
+pdf("umap_integrated_sap_pdac_rlq_celltype.pdf", width = 7, height = 6)
+Idents(sample.integrated.rlq) <- "integrated_snn_res.3"
+for (i in unique(sample.integrated.rlq$celltype)) {
+  cell_names <- colnames(sample.integrated.rlq)[sample.integrated.rlq$celltype == i]
+  print(
+    DimPlot(
+      object = sample.integrated.rlq, cells.highlight = cell_names,
+      cols.highlight = "red", cols = "gray", pt.size = 0.1, order = TRUE, label = T
+    ) + labs(title = i)
+  )
+}
+dev.off()
+
+# ---- cell type distribution under res3
+pdf("umap_integrated_sap_pdac_rlq_cluster_res3.pdf", width = 7, height = 6)
+Idents(sample.integrated.rlq) <- "integrated_snn_res.3"
+for (i in sort(unique(sample.integrated.rlq$integrated_snn_res.3))) {
+  cell_names <- colnames(sample.integrated.rlq)[sample.integrated.rlq$integrated_snn_res.3 == i]
+  print(
+    DimPlot(
+      object = sample.integrated.rlq, cells.highlight = cell_names,
+      cols.highlight = "red", cols = "gray", pt.size = 0.1, order = TRUE, label = T
+    ) + labs(title = i)
+  )
+}
+dev.off()
+
+sum.df <- sample.integrated.rlq@meta.data %>%
+  dplyr::group_by(integrated_snn_res.3) %>%
+  dplyr::summarise(num = n(), gene = mean(nFeature_RNA), count = mean(nCount_RNA), mt = mean(percent.mt))
+dbl.df <- as.data.frame(table(sample.integrated.rlq$integrated_snn_res.3, sample.integrated.rlq$scrublet_callrate)) %>%
+  group_by(Var1) %>%
+  mutate(doublet_rate = Freq / sum(Freq))
+sum.df$dbl_rate <- dbl.df[dbl.df$Var2 == "Doublet", "doublet_rate"]
+print(sum.df %>% arrange(dbl_rate$doublet_rate, gene, count), n = 80)
+```
+
+
+
+
+# Final cell type annotation
+```{r final annotation}
+sample.integrated.rlq$celltype <- sample.integrated.rlq$celltype_singleR
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 0] <- "Ductal_1"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 1] <- "Ductal_1"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 10] <- "Ductal_1"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 11] <- "Acinar"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 12] <- "Acinar"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 13] <- "Acinar"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 14] <- "Acinar"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 15] <- "Endothelial"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 16] <- "Acinar"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 17] <- "CD4T"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 18] <- "Fibroblast"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 19] <- "Acinar"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 2] <- "Ductal_1"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 20] <- "Macrophages"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 21] <- "Ductal_2"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 22] <- "Monocytes"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 23] <- "Ductal_1"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 24] <- "Acinar"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 25] <- "Acinar"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 26] <- "Stellate"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 27] <- "Neutrophils"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 28] <- "Endothelial"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 29] <- "Endothelial"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 3] <- "Ductal_1"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 30] <- "Macrophages"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 31] <- "Acinar"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 32] <- "Acinar"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 33] <- "SMC"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 34] <- "CD4T" # check marker
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 35] <- "Acinar"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 36] <- "Endothelial"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 37] <- "Fibroblast"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 38] <- "NK"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 39] <- "Acinar"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 4] <- "Ductal_1"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 40] <- "Acinar"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 41] <- "Macrophages"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 42] <- "Fibroblast"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 43] <- "Ductal_2"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 44] <- "Endothelial"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 45] <- "Endothelial"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 46] <- "Plasma"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 47] <- "Acinar"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 48] <- "Endocrine"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 49] <- "Endothelial"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 5] <- "Endothelial"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 50] <- "cDC"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 51] <- "Acinar"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 52] <- "Fibroblast"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 53] <- "Stellate"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 54] <- "Ductal_2"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 55] <- "Ductal_2"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 56] <- "Mast"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 57] <- "Bcell"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 58] <- "Fibroblast"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 59] <- "Acinar"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 6] <- "Ductal_1"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 60] <- "Endothelial"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 61] <- "Fibroblast"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 62] <- "Ductal_1"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 7] <- "Endothelial"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 8] <- "Ductal_1"
+sample.integrated.rlq$celltype[sample.integrated.rlq$integrated_snn_res.3 == 9] <- "CD8T"
+table(sample.integrated.rlq$celltype)
+
+sample.integrated.rlq$celltype[sample.integrated.rlq$celltype == "Ductal_1" & sample.integrated.rlq$celltype_singleR == "Acinar cell"] <- "Acinar"
+table(sample.integrated.rlq$celltype)
+# saveRDS(sample.integrated.rlq, file = "sample_integrated_sap_pdac_rlq.rds")
+```
+
+```{r final figure}
+# ---- figures for metadata
+pdf("umap_integrated_sap_pdac_rlq_celltype.pdf", width = 10, height = 8)
+print(
+  DimPlot(object = sample.integrated.rlq, reduction = "umap", label = T, group.by = "celltype")
+)
+dev.off()
+
+pdf("umap_integrated_sap_pdac_rlq_celltype_sample.pdf", width = 42, height = 18)
+print(
+  DimPlot(
+    object = sample.integrated.rlq, reduction = "umap", label = T,
+    group.by = "celltype", split.by = "Patient", raster = F, ncol = 7
+  ) + NoLegend()
+)
+dev.off()
+
+pdf("umap_integrated_sap_pdac_rlq_celltype_group.pdf", width = 20, height = 8)
+print(
+  DimPlot(
+    object = sample.integrated.rlq, reduction = "umap", label = T,
+    group.by = "celltype", split.by = "Group", raster = FALSE
+  ) +
+    NoLegend()
+)
+dev.off()
+```
+
+
+
+
+# Cell type distribution
+```{r stackplot distribution}
+# sample.integrated.rdb <- sample.integrated.rlq
+sample.integrated.rdb <- readRDS("sample_integrated_sap_pdac_rlq.rds")
+Idents(sample.integrated.rdb) <- "celltype"
+table(sample.integrated.rdb$celltype, sample.integrated.rdb$Patient)
+table(sample.integrated.rdb$celltype, sample.integrated.rdb$Group)
+table(sample.integrated.rdb$celltype, sample.integrated.rdb$Cause)
+
+
+# ---- calulate percentage: ~celltype
+group_ct <- as.data.frame(table(sample.integrated.rdb$celltype, sample.integrated.rdb$Group)) %>%
+  group_by(Var1) %>%
+  mutate(percent = Freq / sum(Freq))
+sample_ct <- as.data.frame(table(sample.integrated.rdb$celltype, sample.integrated.rdb$Patient)) %>%
+  group_by(Var1) %>%
+  mutate(percent = Freq / sum(Freq))
+cause_ct <- as.data.frame(table(sample.integrated.rdb$celltype, sample.integrated.rdb$Cause)) %>%
+  group_by(Var1) %>%
+  mutate(percent = Freq / sum(Freq))
+# ---- plot figures
+pdf("stacked_barplot_celltype.pdf", width = 8, height = 3)
+print(
+  ggplot(group_ct, aes(x = Var1, y = percent, fill = Var2)) +
+    geom_bar(stat = "identity") +
+    labs(fill = "Group") +
+    coord_flip() +
+    scale_fill_viridis(discrete = TRUE, option = "viridis") +
+    theme_bw()
+)
+print(
+  ggplot(sample_ct, aes(x = Var1, y = percent, fill = Var2)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    scale_fill_viridis(discrete = TRUE, option = "viridis") +
+    theme_bw()
+)
+print(
+  ggplot(cause_ct, aes(x = Var1, y = percent, fill = Var2)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    scale_fill_viridis(discrete = TRUE, option = "viridis") +
+    theme_bw()
+)
+dev.off()
+
+
+# ---- calulate percentage: celltype~
+ct_group <- as.data.frame(table(sample.integrated.rdb$celltype, sample.integrated.rdb$Group)) %>%
+  group_by(Var2) %>%
+  mutate(percent = Freq / sum(Freq))
+ct_sample <- as.data.frame(table(sample.integrated.rdb$celltype, sample.integrated.rdb$Patient)) %>%
+  group_by(Var2) %>%
+  mutate(percent = Freq / sum(Freq))
+ct_cause <- as.data.frame(table(sample.integrated.rdb$celltype, sample.integrated.rdb$Cause)) %>%
+  group_by(Var2) %>%
+  mutate(percent = Freq / sum(Freq))
+# ---- plot figures
+pdf("stacked_barplot_metadata.pdf", width = 10, height = 8)
+print(
+  ggplot(ct_group, aes(x = Var2, y = percent, fill = Var1)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    scale_fill_viridis(discrete = TRUE, option = "viridis") +
+    theme_bw()
+)
+print(
+  ggplot(ct_sample, aes(x = Var2, y = percent, fill = Var1)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    scale_fill_viridis(discrete = TRUE, option = "viridis") +
+    theme_bw()
+)
+print(
+  ggplot(ct_cause, aes(x = Var2, y = percent, fill = Var1)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    scale_fill_viridis(discrete = TRUE, option = "viridis") +
+    theme_bw()
+)
+dev.off()
+```
+
+```{r boxplot distribution}
+# ---- calulate group percentage
+group_ct <- as.data.frame(table(sample.integrated.rdb$celltype, sample.integrated.rdb$Patient)) %>%
+  group_by(Var2) %>%
+  mutate(percent = Freq / sum(Freq))
+group_ct$group <- sample.integrated.rdb$Group[match(group_ct$Var2, sample.integrated.rdb$Patient)]
+stat_group_celltype <- group_ct %>%
+  group_by(Var1) %>%
+  t_test(percent ~ group) %>%
+  # adjust_pvalue(method = "bonferroni") %>%
+  add_significance("p") %>%
+  add_xy_position(x = "Var1", dodge = 1)
+names(stat_group_celltype)[2] <- "Var2"
+names(stat_group_celltype)[12] <- "group"
+
+# ---- plot figures
+pdf("subtype_boxplot_group.pdf", width = 12, height = 4)
+print(
+  ggplot(group_ct, aes(x = Var1, y = percent, fill = factor(group))) +
+    geom_boxplot(aes(weight = percent), alpha = 0.5) +
+    labs(fill = "Group") +
+    geom_point(position = position_jitterdodge(), alpha = 0.5, size = 0.7) +
+    scale_fill_viridis(discrete = TRUE, option = "viridis") +
+    stat_pvalue_manual(stat_group_celltype, label = "{p}{p.signif}", tip.length = 0, hide.ns = TRUE) +
+    xlab("") +
+    ylab("percentage") +
+    theme_bw(base_size = 16) +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)
+    )
+)
+dev.off()
+```

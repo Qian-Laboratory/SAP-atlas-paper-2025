@@ -1,0 +1,75 @@
+# RNA velocity analysis
+```{r setup}
+# List of packages required
+depp <- c(
+  "languageserver", "httpgd", "Seurat", "DoubletFinder", "dplyr", "DT", "lme4", "wesanderson",
+  "ggplot2", "patchwork", "data.table", "tidyr", "tidyverse", "tidygraph", "circlize",
+  "ggraph", "SeuratWrappers", "doParallel", "openxlsx", "viridis", "rstatix", "paletteer"
+)
+# Check if the packages were installed if not install
+depp_new <- depp[!(depp %in% installed.packages())]
+if (length(depp_new)) {
+  install.packages(depp_new)
+}
+# remotes::install_github('satijalab/seurat-wrappers')
+# remotes::install_github('chris-mcginnis-ucsf/DoubletFinder')
+
+# List of bioconductor packages required by this analysis
+BioDepp <- c(
+  "scater", "slingshot", "destiny", "ggrepel", "RColorBrewer", "miloR", "hypeR",
+  "GSEABase", "ggpubr", "org.Hs.eg.db", "clusterProfiler", "ComplexHeatmap"
+)
+# Check if the packages were installed if not install
+BioDepp_new <- BioDepp[!(BioDepp %in% installed.packages())]
+# install.packages("BiocManager")
+if (length(BioDepp_new)) {
+  BiocManager::install(BioDepp_new)
+}
+
+# load required packages
+sapply(depp, library, character.only = TRUE)
+sapply(BioDepp, library, character.only = TRUE)
+```
+
+
+
+
+
+# Acinar RNA velocity analysis
+```{r RNA velocity}
+library(reticulate)
+library(SeuratDisk)
+# use_condaenv("r", required = TRUE) # if using conda
+
+# ---- convert seurat object to h5ad format
+
+# first convert to h5Seurat file
+DefaultAssay(acinar) <- "RNA"
+SaveH5Seurat(acinar, filename = "./sample_integrated_Acinar.h5Seurat")
+
+# then convert to h5ad, which can be read by scanpy
+Convert(
+  source = "./sample_integrated_Acinar.h5Seurat",
+  assay = "RNA",
+  dest = "./sample_integrated_Acinar.h5ad"
+)
+```
+
+```{bash convert to loom}
+velocyto run10x -m /share/home/qlab/qlab_cdj/reference/hg38/hg38_rmsk.gtf \
+--samtools-threads 30 \
+/bak/groups/qlab/project_10x/3_data/project_yh/SAP/SAP1/ \
+/share/reference/10X/refdata-gex-GRCh38-2020-A/genes/genes.gtf
+```
+
+```{bash transfer all loom files}
+DataPath=/bak/groups/qlab/project_10x/3_data/project_yh/SAP
+MyPath=/share/home/qlab/qlab_cdj/project/02_project_10x_yh_sap
+
+for sample in "NC1_PDAC" "NC1" "NC2_PDAC" "NC2" "NC3_PDAC" "NC4_PDAC" "NC5_PDAC" "NC6_PDAC" "NC7_PDAC" "NC8_PDAC" "NC9_PDAC" "NC10_PDAC" "NC11_PDAC" "SAP1" "SAP2" "SAP3" "SAP4" "SAP5" "SAP6" "SAP7" "SAP8" 
+do
+echo $sample
+mkdir -p $MyPath/matrix/GEX/$sample
+cp -r $DataPath/$sample/velocyto/$sample.loom $MyPath/matrix/loom
+done
+```

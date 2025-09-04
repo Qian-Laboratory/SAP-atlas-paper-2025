@@ -1,0 +1,303 @@
+# cell-cell communication analysis
+```{r setup}
+# List of packages required
+depp <- c(
+  "languageserver", "httpgd", "Seurat", "DoubletFinder", "dplyr", "DT", "lme4",
+  "ggplot2", "patchwork", "data.table", "tidyr", "tidyverse", "tidygraph", "pheatmap",
+  "ggraph", "SeuratWrappers", "doParallel", "openxlsx", "viridis", "rstatix"
+)
+# Check if the packages were installed if not install
+depp_new <- depp[!(depp %in% installed.packages())]
+if (length(depp_new)) {
+  install.packages(depp_new)
+}
+# remotes::install_github('satijalab/seurat-wrappers')
+# remotes::install_github('chris-mcginnis-ucsf/DoubletFinder')
+
+# List of bioconductor packages required by this analysis
+BioDepp <- c(
+  "scater", "slingshot", "destiny", "ggrepel", "RColorBrewer", "ktplots", "ReactomePA",
+  "GSEABase", "ggpubr", "org.Hs.eg.db", "clusterProfiler", "BiocParallel", "ComplexHeatmap", "circlize"
+)
+# Check if the packages were installed if not install
+BioDepp_new <- BioDepp[!(BioDepp %in% installed.packages())]
+# install.packages("BiocManager")
+if (length(BioDepp_new)) {
+  BiocManager::install(BioDepp_new)
+}
+
+# load required packages
+sapply(depp, library, character.only = TRUE)
+sapply(BioDepp, library, character.only = TRUE)
+```
+
+
+
+
+
+# prepare input
+```{r generate inputs for each sample}
+# sample.tme.rdb <- readRDS("../result/sample_tme.rds")
+sample_list <- unique(sample.tme.rdb$Patient)
+for (sample in sample_list) {
+  print(sample)
+  # ---- make dir
+  dir <- paste0("../cci_cpdb/", sample)
+  system(paste0("mkdir ", dir))
+
+  sample.rna <- subset(sample.tme.rdb, subset = Patient == sample)
+  DefaultAssay(sample.rna) <- "RNA"
+  sample.rna[["integrated"]] <- NULL
+
+  # ---- h5ad file
+  # first convert to h5Seurat file
+  SeuratDisk::SaveH5Seurat(sample.rna, filename = paste0(dir, "/sample_tme.h5Seurat"))
+  # then convert to h5ad
+  SeuratDisk::Convert(
+    source = paste0(dir, "/sample_tme.h5Seurat"),
+    assay = "RNA",
+    dest = paste0(dir, "/sample_tme.h5ad")
+  )
+
+  # ---- metadata
+  sample_rna_meta <- sample.rna@meta.data %>% as.data.frame()
+  metadata_output <- data.frame(Cell = rownames(sample_rna_meta), cell_type = sample_rna_meta$celltype)
+  head(sample_rna_meta)
+  head(metadata_output)
+  write_tsv(metadata_output, paste0(dir, "/sample_tme_celltype_metadata.tsv"))
+}
+```
+
+
+
+
+
+# run CellPhoneDB (run in python)
+```{python cpdb}
+import pandas as pd
+import sys
+import os
+
+sample_list = [
+  "NC1","NC2","NC1_pdac","NC2_pdac","NC3_pdac",
+  "NC4_pdac","NC5_pdac","NC6_pdac","NC7_pdac","NC8_pdac",
+  "NC9_pdac","NC10_pdac","NC11_pdac","SAP1","SAP2",
+  "SAP3","SAP4","SAP5","SAP6","SAP7","SAP8"  
+]
+sample_list
+
+import anndata
+from cellphonedb.src.core.methods import cpdb_statistical_analysis_method
+
+
+for sample in sample_list:
+    print ('Running CellPhoneDB for %s'% sample)
+    cpdb_file_path = '../../../../reference/CellPhoneDB/cellphonedb.zip'
+    meta_file_path = '../cci_cpdb/'+sample+'/sample_tme_celltype_metadata.tsv'
+    counts_file_path = '../cci_cpdb/'+sample+'/sample_tme.h5ad'
+    out_path = '../cci_cpdb/'+sample
+    metadata = pd.read_csv(meta_file_path, sep = '\t')
+    metadata.head(3)
+    adata = anndata.read_h5ad(counts_file_path)
+    adata.shape
+    list(adata.obs.index).sort() == list(metadata['Cell']).sort()
+    # deconvoluted, means, pvalues, significant_means
+    cpdb_results = cpdb_statistical_analysis_method.call(
+      cpdb_file_path = cpdb_file_path, # mandatory: CellphoneDB database zip file.
+      meta_file_path = meta_file_path, # mandatory: tsv file defining barcodes to cell label.
+      counts_file_path = counts_file_path, # mandatory: normalized count matrix - a path to the counts file, or an in-memory AnnData object
+      counts_data = "hgnc_symbol", # defines the gene annotation in counts matrix.
+      score_interactions = True, # optional: whether to score interactions or not.
+      iterations = 1000, # denotes the number of shufflings performed in the analysis.
+      threshold = 0.1, # defines the min % of cells expressing a gene for this to be employed in the analysis.
+      threads = 5, # number of threads to use in the analysis.
+      debug_seed = 42, # debug randome seed. To disable >=0.
+      result_precision = 3, # Sets the rounding for the mean values in significan_means.
+      pvalue = 0.05, # P-value threshold to employ for significance.
+      subsampling = False, # To enable subsampling the data (geometri sketching).
+      subsampling_log = False, # (mandatory) enable subsampling log1p for non log-transformed data inputs.
+      subsampling_num_pc = 100, # Number of componets to subsample via geometric skectching (dafault: 100).
+      separator = "AAAAA", # Sets the string to employ to separate cells in the results dataframes "cellA|CellB".
+      debug = False, # Saves all intermediate tables employed during the analysis in pkl format.
+      output_path = out_path, # Path to save results.
+      output_suffix = "celltype" # Replaces the timestamp in the output files by a user defined string in the  (default: None).
+    )
+```
+
+
+
+
+
+# compare CCI - SAP vs NC
+```{r compare CCI}
+# sample.tme.rdb <- readRDS("../10_CCI_multinichenet/sample_tme.rds")
+
+# ---- cpdb metadata
+cpdb_meta <- data.frame(
+  sample_id = sort(unique(sample.tme.rdb$Patient)),
+  cellphonedb_folder = paste0("../cci_cpdb/h5ad/", sort(unique(sample.tme.rdb$Patient))),
+  sce_file = paste0("../cci_cpdb/h5ad/", sort(unique(sample.tme.rdb$Patient)), "/sample_tme.h5ad"),
+  interaction_score = paste0("../cci_cpdb/h5ad/", sort(unique(sample.tme.rdb$Patient)), "/statistical_analysis_interaction_scores_celltype.txt")
+)
+head(cpdb_meta)
+
+
+# ---- sample metadata
+sample_metadata <- as.data.frame(sample.tme.rdb@meta.data[, c("Patient", "Group")] %>% unique())
+sample_metadata <- sample_metadata[match(cpdb_meta$sample_id, sample_metadata$Patient), ]
+rownames(sample_metadata) <- NULL
+head(sample_metadata)
+
+
+# ---- compare cpdb
+sample.tme.rdb$celltype %>% unique()
+BiocParallel::register(BiocParallel::SerialParam(), default = TRUE)
+out <- compare_cpdb(
+  cpdb_meta = cpdb_meta,
+  sample_metadata = sample_metadata,
+  celltypes = unique(sample.tme.rdb$celltype),
+  celltype_col = "celltype",
+  method = "wilcox.test",
+  groupby = "Group"
+)
+save(out, file = "../cci_cpdb/celltype_cpdb_compare.rda")
+```
+
+```{r sap_vs_nc}
+load("../cci_cpdb/celltype_cpdb_compare.rda")
+out_table <- out
+colnames(out_table)[1] <- "LRP"
+colnames(out_table)[2] <- "pval"
+head(out_table)
+
+# split from and to celltype
+rows <- strsplit(out_table$LRP, ">@<")
+from <- lapply(rows, function(x) x[1])
+from <- do.call(rbind, from)
+to <- lapply(rows, function(x) x[2])
+to <- do.call(rbind, to)
+interaction <- lapply(rows, function(x) x[3])
+interaction <- do.call(rbind, interaction)
+
+colnames(out_table)
+head(out_table)
+
+out_table <- as.data.frame(cbind(
+  out_table[, c("LRP")],
+  interaction = interaction, from = from, to = to,
+  out_table[, c(2, 26, 3:25)]
+))
+head(out_table)
+
+# save result
+write_csv(out_table, "../cci_cpdb/celltype_cpdb_compare.csv")
+```
+
+
+
+
+
+# lrp analysis
+## reactome pathway
+```{r lrp analysis}
+out_table <- read_csv("../cci_cpdb/celltype_cpdb_compare.csv")
+for (ct1 in unique(out_table$from)) {
+  for (ct2 in unique(out_table$to)) {
+    print(paste0(ct1, "-", ct2))
+
+    # ---- pathway analysis
+    # ---- sap
+    out_table_macro_endo <- out_table %>%
+      filter(from == ct1 & to == ct2) %>%
+      filter(sap_count < 3) %>%
+      filter(pval < 0.05) %>%
+      filter(sap_mean > 0.5) %>%
+      filter(logFC_mean > 0.1) %>%
+      arrange(-logFC_mean)
+    out_table_macro_endo_all <- out_table_macro_endo
+    if (nrow(out_table_macro_endo) > 0) {
+      genes_all <- out_table_macro_endo$interaction_gene
+      cp_reactome_all <- NULL
+      for (genes in genes_all) {
+        genes <- strsplit(genes, split = "-") %>%
+          unlist() %>%
+          unique()
+        genes <- gsub("^A$", "HLA-A", genes)
+        genes <- gsub("^B$", "HLA-B", genes)
+        genes <- gsub("^C$", "HLA-C", genes)
+        genes <- gsub("^D$", "HLA-D", genes)
+        genes <- gsub("^E$", "HLA-E", genes)
+        genes <- gsub("^F$", "HLA-F", genes)
+        genes <- gsub("^G$", "HLA-G", genes)
+        genes_entriz <- bitr(genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = "org.Hs.eg.db")
+        # reactome pathway
+        cp_reactome <- enrichPathway(gene = genes_entriz$ENTREZID, pvalueCutoff = 0.05, readable = TRUE)
+        cp_reactome <- as.data.frame(cp_reactome)
+        cp_reactome <- cp_reactome[cp_reactome$Count == nrow(genes_entriz), ]
+        if (nrow(cp_reactome) > 0) {
+          cp_reactome$celltypes <- paste0(ct1, "-", ct2)
+          cp_reactome$dir <- "SAP"
+          cp_reactome_all <- rbind(cp_reactome_all, cp_reactome)
+        }
+      }
+    }
+
+    # ---- nc
+    out_table_macro_endo <- out_table %>%
+      filter(from == ct1 & to == ct2) %>%
+      filter(nc_count < 5) %>%
+      filter(pval < 0.05) %>%
+      filter(nc_mean > 0.5) %>%
+      filter(logFC_mean < -0.1) %>%
+      arrange(logFC_mean)
+    out_table_macro_endo_all <- rbind(out_table_macro_endo_all, out_table_macro_endo)
+    if (nrow(out_table_macro_endo) > 0) {
+      genes_all <- out_table_macro_endo$interaction_gene
+      for (genes in genes_all) {
+        genes <- strsplit(genes, split = "-") %>%
+          unlist() %>%
+          unique()
+        genes <- gsub("^A$", "HLA-A", genes)
+        genes <- gsub("^B$", "HLA-B", genes)
+        genes <- gsub("^C$", "HLA-C", genes)
+        genes <- gsub("^D$", "HLA-D", genes)
+        genes <- gsub("^E$", "HLA-E", genes)
+        genes <- gsub("^F$", "HLA-F", genes)
+        genes <- gsub("^G$", "HLA-G", genes)
+        genes_entriz <- bitr(genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = "org.Hs.eg.db")
+        # reactome pathway
+        cp_reactome <- enrichPathway(gene = genes_entriz$ENTREZID, pvalueCutoff = 0.05, readable = TRUE)
+        cp_reactome <- as.data.frame(cp_reactome)
+        cp_reactome <- cp_reactome[cp_reactome$Count == nrow(genes_entriz), ]
+        if (nrow(cp_reactome) > 0) {
+          cp_reactome$celltypes <- paste0(ct1, "-", ct2)
+          cp_reactome$dir <- "NC"
+          cp_reactome_all <- rbind(cp_reactome_all, cp_reactome)
+        }
+      }
+    }
+
+    # ---- heatmap
+    colnames(out_table_macro_endo_all)
+    if (nrow(out_table_macro_endo_all) > 0) {
+      lrp_matrix <- out_table_macro_endo_all[, c(10:30)] %>% t()
+      colnames(lrp_matrix) <- out_table_macro_endo_all$interaction_gene
+      type.label <- c(rep("NC", 13), rep("SAP", 8))
+      lrp.label <- c(
+        rep("Higher_in_SAP", length(which(out_table_macro_endo_all$logFC_mean > 0))),
+        rep("Higher_in_NC", length(which(out_table_macro_endo_all$logFC_mean < 0)))
+      )
+      pdf(paste0("../../figures/cci_cpdb/celltype_heatmap_", ct1, "_", ct2, ".pdf"), width = 20, height = 10)
+      print(
+        Heatmap(scale(lrp_matrix),
+          name = "LRP Mean", cluster_rows = T, cluster_columns = T,
+          col = rev(colorRampPalette(brewer.pal(10, "RdYlBu"))(256)),
+          column_names_gp = gpar(fontsize = 10),
+          column_split = lrp.label, row_split = type.label
+        )
+      )
+      dev.off()
+    }
+  }
+}
+```

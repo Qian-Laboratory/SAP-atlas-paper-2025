@@ -1,0 +1,39 @@
+# Check contamination
+```{r contamination genes}
+sample.integrated.rdb <- readRDS("sample_integrated_sap_pdac_rlq.rds")
+sample.integrated.rdb <- sample.integrated.rlq
+
+dim(pancreatic.markers)
+pancreas.genes <- pancreatic.markers %>%
+  filter(p_val_adj < 0.05) %>%
+  filter(avg_log2FC > 1.5) %>%
+  arrange(-avg_log2FC)
+dim(pancreas.genes)
+pancreas.genes[grep("OLFM4", rownames(pancreas.genes)), ]
+pancreas.genes[54, ]
+
+pdf("OLFM4.pdf", width = 6, height = 5)
+DefaultAssay(sample.integrated.rdb) <- "RNA"
+Idents(sample.integrated.rdb) <- "celltype"
+print(
+  FeaturePlot(sample.integrated.rdb, features = "SORBS2", label = T)
+)
+print(
+  VlnPlot(sample.integrated.rdb, features = "SORBS2", assay = "RNA", group.by = "celltype", pt.size = 0)
+)
+dev.off()
+
+
+# ---- pancreatic markers
+de.pancreatic <- FindMarkers(
+  sample.integrated.rdb,
+  ident.1 = c("Acinar", "Ductal_1", "Ductal_2"),
+  group.by = "celltype",
+  assay = "RNA",
+  logfc.threshold = 0.5,
+  only.pos = TRUE
+)
+de.pancreatic[grep("OLFM4", rownames(de.pancreatic)), ]
+de.pancreatic[de.pancreatic$p_val_adj < 0.05, ]
+```
+

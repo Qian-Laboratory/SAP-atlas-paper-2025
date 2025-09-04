@@ -1,0 +1,164 @@
+# cell-cell communication analysis
+```{r setup}
+# List of packages required
+depp <- c(
+  "languageserver", "httpgd", "Seurat", "DoubletFinder", "dplyr", "DT", "lme4",
+  "ggplot2", "patchwork", "data.table", "tidyr", "tidyverse", "tidygraph", "pheatmap",
+  "ggraph", "SeuratWrappers", "doParallel", "openxlsx", "viridis", "rstatix"
+)
+# Check if the packages were installed if not install
+depp_new <- depp[!(depp %in% installed.packages())]
+if (length(depp_new)) {
+  install.packages(depp_new)
+}
+# remotes::install_github('satijalab/seurat-wrappers')
+# remotes::install_github('chris-mcginnis-ucsf/DoubletFinder')
+
+# List of bioconductor packages required by this analysis
+BioDepp <- c(
+  "scater", "slingshot", "destiny", "ggrepel", "RColorBrewer", "ktplots", "ReactomePA",
+  "GSEABase", "ggpubr", "org.Hs.eg.db", "clusterProfiler", "BiocParallel", "ComplexHeatmap", "circlize"
+)
+# Check if the packages were installed if not install
+BioDepp_new <- BioDepp[!(BioDepp %in% installed.packages())]
+# install.packages("BiocManager")
+if (length(BioDepp_new)) {
+  BiocManager::install(BioDepp_new)
+}
+
+# load required packages
+sapply(depp, library, character.only = TRUE)
+sapply(BioDepp, library, character.only = TRUE)
+```
+
+```{r trajectory analysis}
+fibroblast <- readRDS("sample_integrated_fibro_rdb.rds")
+fibroblast_sub <- subset(fibroblast, subset = cellsubtype %in% c("SMC_MYH11", "Stellate_RGS5"), invert = T)
+table(fibroblast_sub$cellsubtype)
+
+
+# ---- slingshot
+sds <- slingshot(
+  Embeddings(fibroblast_sub, "umap"),
+  clusterLabels = fibroblast_sub$cellsubtype,
+  start.clus = "Fib_PI16(Adventitial)",
+  end.clus = c("Fib_APOD(Adipogenic)", "Fib_MMP11(Tissue_remodeling)", "Fib_IL6(Inflammatory)"),
+  stretch = 0
+)
+lineages <- slingLineages(sds)
+lineages
+curves <- slingCurves(sds, as.df = TRUE)
+curved <- rbind(curves[curves$Lineage == 1, ], curves[curves$Lineage == 2, ], curves[curves$Lineage == 3, ])
+curved$Lineage[curved$Lineage == 1] <- "Lineage1"
+curved$Lineage[curved$Lineage == 2] <- "Lineage2"
+curved$Lineage[curved$Lineage == 3] <- "Lineage3"
+
+fibroblast_sub$Pseudotime1 <- slingPseudotime(sds)[, 1]
+fibroblast_sub$Pseudotime1 <- (fibroblast_sub$Pseudotime1 - min(fibroblast_sub$Pseudotime1, na.rm = T)) /
+  (max(fibroblast_sub$Pseudotime1, na.rm = T) - min(fibroblast_sub$Pseudotime1, na.rm = T)) * 100
+fibroblast_sub$Pseudotime2 <- slingPseudotime(sds)[, 2]
+fibroblast_sub$Pseudotime2 <- (fibroblast_sub$Pseudotime2 - min(fibroblast_sub$Pseudotime2, na.rm = T)) /
+  (max(fibroblast_sub$Pseudotime2, na.rm = T) - min(fibroblast_sub$Pseudotime2, na.rm = T)) * 100
+fibroblast_sub$Pseudotime3 <- slingPseudotime(sds)[, 3]
+fibroblast_sub$Pseudotime3 <- (fibroblast_sub$Pseudotime3 - min(fibroblast_sub$Pseudotime3, na.rm = T)) /
+  (max(fibroblast_sub$Pseudotime3, na.rm = T) - min(fibroblast_sub$Pseudotime3, na.rm = T)) * 100
+fibroblast_sub$Pseudotime <- rowMeans(fibroblast_sub@meta.data[, c("Pseudotime1", "Pseudotime2", "Pseudotime3")], na.rm = T)
+head(fibroblast_sub@meta.data[, c("Pseudotime1", "Pseudotime2", "Pseudotime3", "Pseudotime")])
+
+str(fibroblast_sub@reductions$umap)
+data <- FetchData(fibroblast_sub,
+  vars = c("UMAP_1", "UMAP_2", "Group", "cellsubtype", "Pseudotime", "Pseudotime1", "Pseudotime2", "Pseudotime3")
+)
+
+pdf("../figure/fibro_sub_lineage.pdf", width = 6.5, height = 4)
+DimPlot(object = fibroblast_sub, reduction = "umap", label = T, group.by = "cellsubtype") +
+  geom_path(aes_string("UMAP_1", "UMAP_2", linetype = "Lineage"), curved, size = 1)
+dev.off()
+
+pdf("../figure/fibro_sub_pseudotime.pdf", width = 5, height = 4)
+FeaturePlot(fibroblast_sub, feature = "Pseudotime") +
+  scale_color_distiller(palette = "YlOrRd", na.value = "grey90")
+dev.off()
+```
+
+```{r trajectory density plot}
+pdf("../figure/fibro_sub_density_group.pdf", width = 4, height = 1.5)
+tmp.p1 <- fibroblast_sub@meta.data[!is.na(fibroblast_sub$Pseudotime1), ]
+ggplot(tmp.p1, aes(x = Pseudotime1, colour = Group)) +
+  geom_density() +
+  scale_color_viridis(discrete = TRUE, option = "viridis") +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  labs(colour = "Tissue") +
+  xlab("Pseudotime:Lineage1_Fib_MMP11")
+tmp.p2 <- fibroblast_sub@meta.data[!is.na(fibroblast_sub$Pseudotime2), ]
+ggplot(tmp.p2, aes(x = Pseudotime2, colour = Group)) +
+  geom_density() +
+  scale_color_viridis(discrete = TRUE, option = "viridis") +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  labs(colour = "Tissue") +
+  xlab("Pseudotime:Lineage2_Fib_APOD")
+tmp.p3 <- fibroblast_sub@meta.data[!is.na(fibroblast_sub$Pseudotime3), ]
+ggplot(tmp.p3, aes(x = Pseudotime3, colour = Group)) +
+  geom_density() +
+  scale_color_viridis(discrete = TRUE, option = "viridis") +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  labs(colour = "Tissue") +
+  xlab("Pseudotime:Lineage3_Fib_IL6")
+dev.off()
+```
+
+```{r gene expression trends}
+activated_genes <- c(
+  "DCN", "GSN", "CLEC3B", "GSTM1", "ACTA2",
+  "TAGLN", "TGFB1", "IL6", "IL11", "CXCL12", "CCL2", "APOD", "MMP11", "CXCL5", "CCN4", "IL33",
+  "COL1A1", "COL3A1", "COL1A2", "POSTN", "CCL7", "CCL5"
+)
+DefaultAssay(fibroblast_sub) <- "RNA"
+match(activated_genes, rownames(fibroblast_sub))
+
+matrix <- GetAssayData(fibroblast_sub, assay = "RNA")
+expr_matrix <- as.data.frame(t(rbind(matrix[activated_genes, , drop = FALSE],
+  Pseudotime1 = fibroblast_sub$Pseudotime1,
+  Pseudotime2 = fibroblast_sub$Pseudotime2,
+  Pseudotime3 = fibroblast_sub$Pseudotime3
+)))
+expr_matrix$Group <- fibroblast_sub$Group
+head(expr_matrix)
+df <- pivot_longer(expr_matrix, activated_genes, names_to = "feature", values_to = "expr")
+head(df)
+
+df_l1 <- df[!is.na(df$Pseudotime1), ]
+df_l2 <- df[!is.na(df$Pseudotime2), ]
+df_l3 <- df[!is.na(df$Pseudotime3), ]
+head(df_l1)
+
+pdf("../figure/fibro_lineage_gene_expression_trend.pdf", width = 7, height = 4)
+ggplot(df_l1) +
+  geom_smooth(aes(x = Pseudotime1, y = expr, color = Group, fill = Group), method = "loess", se = F) +
+  xlab("Lineage1_Fib_MMP11") +
+  ylab("Expression") +
+  theme_bw() +
+  # scale_color_manual(values = c("NC" = "#8ea1cb", "SAP" = "#f68e63")) +
+  # scale_y_log10() +
+  facet_wrap(~feature, scales = "free_y")
+ggplot(df_l2) +
+  geom_smooth(aes(x = Pseudotime2, y = expr, color = Group, fill = Group), method = "loess", se = F) +
+  xlab("Lineage2_Fib_APOD") +
+  ylab("Expression") +
+  theme_bw() +
+  # scale_color_manual(values = c("NC" = "#8ea1cb", "SAP" = "#f68e63")) +
+  # scale_y_log10() +
+  facet_wrap(~feature, scales = "free_y")
+ggplot(df_l3) +
+  geom_smooth(aes(x = Pseudotime3, y = expr, color = Group, fill = Group), method = "loess", se = F) +
+  xlab("Lineage3_Fib_IL6") +
+  ylab("Expression") +
+  theme_bw() +
+  # scale_color_manual(values = c("NC" = "#8ea1cb", "SAP" = "#f68e63")) +
+  # scale_y_log10() +
+  facet_wrap(~feature, scales = "free_y")
+dev.off()
+```

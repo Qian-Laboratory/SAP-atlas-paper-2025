@@ -1,0 +1,506 @@
+# preprocessing
+```{r setup}
+# List of packages required
+depp <- c(
+  "languageserver", "httpgd", "Seurat", "DoubletFinder", "dplyr", "DT", "hdf5r",
+  "ggplot2", "patchwork", "data.table", "tidyr", "tidyverse", "tidygraph",
+  "ggraph", "SeuratWrappers", "doParallel", "openxlsx", "viridis", "rstatix"
+)
+# Check if the packages were installed if not install
+depp_new <- depp[!(depp %in% installed.packages())]
+if (length(depp_new)) {
+  install.packages(depp_new)
+}
+# remotes::install_github('satijalab/seurat-wrappers')
+# remotes::install_github('chris-mcginnis-ucsf/DoubletFinder')
+
+# List of bioconductor packages required by this analysis
+BioDepp <- c(
+  "scater", "SingleR", "slingshot", "ComplexHeatmap", "destiny",
+  "GSEABase", "ggpubr", "org.Hs.eg.db", "ReactomePA"
+)
+# Check if the packages were installed if not install
+BioDepp_new <- BioDepp[!(BioDepp %in% installed.packages())]
+# install.packages("BiocManager")
+if (length(BioDepp_new)) {
+  BiocManager::install(BioDepp_new)
+}
+
+# load required packages
+sapply(depp, library, character.only = TRUE)
+sapply(BioDepp, library, character.only = TRUE)
+```
+
+
+
+# doublet detection and create seurat object
+```{r srublet}
+sample_ids <- list.files("/share/home/qlab/project_10x/3_data/project_yh/SAP//")
+sample_ids
+result_list <- vector("list", length(sample_ids))
+names(result_list) <- sample_ids
+
+for (sample_id in sample_ids) {
+  tryCatch(
+    {
+      #### ---- read scrublet result
+      scrublet_path <- paste0(
+        "/share/home/qlab/project_10x/3_data/project_yh/SAP/",
+        sample_id, "/outs/filtered_feature_bc_matrix/doublet.txt"
+      )
+      scrublet_data <- read.delim(scrublet_path, sep = ",", stringsAsFactors = F)
+
+
+      #### ---- DoubletFinder
+      cellranger_path <- paste0(
+        "/share/home/qlab/project_10x/3_data/project_yh/SAP/",
+        sample_id, "/outs/filtered_feature_bc_matrix.h5"
+      )
+      cellranger_data <- Read10X_h5(cellranger_path)
+      seurat_obj <- CreateSeuratObject(counts = cellranger_data, project = sample_id)
+      seurat_obj <- NormalizeData(seurat_obj)
+      seurat_obj <- FindVariableFeatures(seurat_obj)
+      seurat_obj <- ScaleData(seurat_obj)
+      seurat_obj <- RunPCA(seurat_obj, npcs = 100)
+      seurat_obj <- JackStraw(seurat_obj, dims = 100)
+      seurat_obj <- ScoreJackStraw(seurat_obj, dims = 1:100)
+
+      # extract npcs
+      pdf(paste0("../figure/pdf/JackStrawPlot_", sample_id, ".pdf"), width = 24)
+      print(JackStrawPlot(seurat_obj, dims = 1:100))
+      dev.off()
+
+      js.plot <- JackStrawPlot(seurat_obj, dims = 1:100)
+      pval_matrix <- seurat_obj@reductions$pca@jackstraw$overall.p.values
+      npcs <- min(which(pval_matrix[, 2] >= 0.05)) - 1
+      message(paste(sample_id, "using", npcs, "PCs"))
+
+      seurat_obj <- RunUMAP(seurat_obj, reduction = "pca", dim = 1:npcs)
+      seurat_obj <- FindNeighbors(seurat_obj, reduction = "pca", dim = 1:npcs)
+      seurat_obj <- FindClusters(seurat_obj, resolution = 0.8)
+
+      # DoubletFinder test parameters
+      sweep.res <- paramSweep(seurat_obj, PCs = 1:npcs, sct = FALSE)
+      sweep.stats <- summarizeSweep(sweep.res, GT = FALSE)
+      bcmvn <- find.pK(sweep.stats)
+      pK_bcmvn <- bcmvn$pK[which.max(bcmvn$BCmetric)] %>%
+        as.character() %>%
+        as.numeric()
+
+      # Homotypic Doublet Proportion Estimate
+      annotations <- seurat_obj@meta.data$seurat_clusters
+      homotypic.prop <- modelHomotypic(annotations)
+      DoubletRate <- ncol(scrublet_data) * 8 * 1e-6
+      nExp_poi <- round(DoubletRate * nrow(seurat_obj@meta.data))
+      nExp_poi.adj <- round(nExp_poi * (1 - homotypic.prop))
+      # doublet detection
+      seurat_obj <- doubletFinder(
+        seurat_obj,
+        PCs = 1:npcs,
+        pN = 0.25,
+        pK = pK_bcmvn,
+        nExp = nExp_poi.adj,
+        reuse.pANN = FALSE,
+        sct = FALSE
+      )
+      seurat_obj_DoubletFinder <- seurat_obj@meta.data %>% dplyr::select(contains("pANN"), contains("DF.classifications"))
+      colnames(seurat_obj_DoubletFinder) <- c("DF.pANN", "DF.classifications")
+
+
+      #### ---- create seurat object
+      cellbender_path <- paste0(
+        "/share/home/qlab/project_10x/3_data/project_yh/SAP/",
+        sample_id, "/outs/raw_feature_bc_matrix_cb_cell_barcodes.csv"
+      )
+      cellbender_data <- read_csv(cellbender_path, col_names = "cell") %>% pull(cell)
+
+      # QC based on CellBender
+      seurat_obj_CR_CB <- cellranger_data[, colnames(cellranger_data) %in% cellbender_data]
+
+      # create seurat object
+      seurat_obj <- CreateSeuratObject(counts = seurat_obj_CR_CB, project = sample_id, min.cells = 3)
+      seurat_obj <- NormalizeData(seurat_obj)
+      seurat_obj[["percent.mt"]] <- PercentageFeatureSet(object = seurat_obj, pattern = "^MT-")
+
+      # sample info
+      seurat_obj$Sample <- sample_id
+
+      # cell cycle
+      seurat_obj <- CellCycleScoring(seurat_obj, s.features = cc.genes.updated.2019$s.genes, g2m.features = cc.genes.updated.2019$g2m.genes)
+
+      # add doublet detection score to meta.data
+      seurat_obj$scrublet_score <- scrublet_data$doublet_scores[match(colnames(seurat_obj), scrublet_data$barcode)]
+      seurat_obj$scrublet_call <- scrublet_data$predicted_doublets[match(colnames(seurat_obj), scrublet_data$barcode)]
+      seurat_obj$scrublet_callrate <- ifelse(seurat_obj$scrublet_call, "Doublet", "Singlet")
+      seurat_obj$DF.pANN <- seurat_obj_DoubletFinder$DF.pANN[match(colnames(seurat_obj), rownames(seurat_obj_DoubletFinder))]
+      seurat_obj$DF.classifications <- seurat_obj_DoubletFinder$DF.classifications[match(colnames(seurat_obj), rownames(seurat_obj_DoubletFinder))]
+
+
+      #### ---- save result
+      result_list[[sample_id]] <- seurat_obj
+    },
+    error = function(e) {
+      message(paste("Error processing", sample_id, ":", e$message))
+    }
+  )
+}
+
+# failed samples
+sapply(result_list, is.null)
+# result_list <- result_list[!sapply(result_list, is.null)]
+save(result_list, file = "../result/SAP_list.rda")
+```
+
+
+
+
+# Merge all samples
+```{r merge all samples}
+sap.merge <- merge(
+  x = nc1, y = c(nc2, sap1, sap2, sap3, sap4, sap5, sap6, sap7, sap8),
+  add.cell.ids = sample_id,
+  project = "SAP"
+)
+sap.merge <- subset(sap.merge, subset = nFeature_RNA > 200 & nCount_RNA > 400 & percent.mt < 25)
+saveRDS(sap.merge, file = "../analysis/SAP_merge.rds")
+```
+
+
+
+
+
+# Preprocessing
+```{r preprocessing}
+sample.combined <- readRDS("../analysis/SAP_merge.rds")
+
+# inferferon genes
+msigdb <- getBroadSets("/share/reference/sigdb/msigdb_v7.4.xml")
+index <- sapply(msigdb, function(gs) {
+  bcCategory(collectionType(gs)) == "c2"
+})
+geneset.c2 <- msigdb[index]
+geneset.interferon <- geneset.c2[["BROWNE_INTERFERON_RESPONSIVE_GENES"]]
+interferon.genes <- geneset.interferon@geneIds
+interferon.genes <- interferon.genes[interferon.genes %in% rownames(sample.combined)]
+sample.combined <- AddModuleScore(
+  object = sample.combined,
+  features = list(interferon.genes),
+  ctrl = length(interferon.genes),
+  name = "IFN.Score",
+  assay = "RNA"
+)
+
+# 32 stress genes
+stress.genes <- read_csv("~/reference/stress.genes.csv") %>%
+  dplyr::filter(gene %in% rownames(sample.combined)) %>%
+  dplyr::pull(gene)
+sample.combined <- AddModuleScore(
+  object = sample.combined,
+  features = list(stress.genes),
+  ctrl = length(stress.genes),
+  name = "Stress.Score",
+  assay = "RNA"
+)
+
+# hypoxia genes
+genes.hypoxia <- c(
+  "VEGFA", "SLC2A1", "PGAM1", "ENO1",
+  "LDHA", "TPI1", "P4HA1", "MRPS17",
+  "CDKN3", "ADM", "NDRG1", "TUBB6",
+  "ALDOA", "MIF", "ACOT7"
+)
+sample.combined <- AddModuleScore(
+  object = sample.combined,
+  features = list(genes.hypoxia),
+  ctrl = length(genes.hypoxia),
+  name = "Hypoxia.Score"
+)
+head(sample.combined@meta.data)
+
+# feature selection
+sample.combined <- FindVariableFeatures(sample.combined, selection.method = "vst", nfeatures = 3000)
+var.genes <- VariableFeatures(sample.combined)
+hgGenes <- c("HBA1", "HBA2", "HBB", "HBD", "HBE1", "HBG1", "HBG2", "HBM", "HBQ1", "HBZ")
+igGenes <- c(
+  "IGHA1", "IGHA2", "IGHG1", "IGHG2", "IGHG3", "IGHG4", "IGHD", "IGHE", "JCHAIN",
+  "IGHM", "IGLC1", "IGLC2", "IGLC3", "IGLC4", "IGLC5", "IGLC6", "IGLC7", "IGKC"
+)
+IG.gene1 <- grep(pattern = "^IGLV", x = rownames(x = sample.combined), value = TRUE)
+IG.gene2 <- grep(pattern = "^IGKV", x = rownames(x = sample.combined), value = TRUE)
+IG.gene3 <- grep(pattern = "^IGHV", x = rownames(x = sample.combined), value = TRUE)
+IG.genes <- union(IG.gene1, c(IG.gene2, IG.gene3))
+
+TRDV.genes <- grep(pattern = "^TRDV", x = rownames(x = sample.combined), value = TRUE)
+TRAV.genes <- grep(pattern = "^TRAV", x = rownames(x = sample.combined), value = TRUE)
+TRBV.genes <- grep(pattern = "^TRBV", x = rownames(x = sample.combined), value = TRUE)
+TRGV.genes <- grep(pattern = "^TRGV", x = rownames(x = sample.combined), value = TRUE)
+TRV.genes <- union(TRDV.genes, c(TRAV.genes, TRBV.genes, TRGV.genes))
+RPS.genes <- grep(pattern = "^RPS", x = rownames(x = sample.combined), value = TRUE)
+RPL.genes <- grep(pattern = "^RPL", x = rownames(x = sample.combined), value = TRUE)
+MT.genes <- grep(pattern = "^MT-", x = rownames(x = sample.combined), value = TRUE)
+HIST.genes <- grep(pattern = "^HIST", x = rownames(x = sample.combined), value = TRUE)
+
+var.genes <- var.genes[!var.genes %in% c(IG.genes, TRV.genes)]
+
+plan("multiprocess", workers = 10)
+plan()
+options(future.globals.maxSize = 20 * 1000 * 1024^2)
+sample.combined <- ScaleData(sample.combined,
+  vars.to.regress = c("nFeature_RNA", "nCount_RNA", "percent.mt", "G2M.Score", "S.Score"),
+  features = var.genes
+)
+sample.combined <- RunPCA(sample.combined, features = var.genes, npcs = 50)
+```
+
+
+
+
+
+# Integration
+```{r data integration}
+DefaultAssay(sample.combined) <- "RNA"
+sample.list <- SplitObject(sample.combined, split.by = "Patient")
+
+sample.list <- purrr::map(sample.list, function(x) {
+  x <- NormalizeData(x, verbose = TRUE)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+})
+
+features.select <- SelectIntegrationFeatures(object.list = sample.list, nfeatures = 2500)
+
+# discard the not needed
+genes.cc <- extract_cellcycle(sample.combined, features.select, cores = 10, assay = "RNA", cutoff = 0.05)
+genes.stress <- extract_stress(sample.combined, features.select, cores = 10, assay = "RNA", cutoff = 0.1)
+# genes.ifn <- extract_ifn(sample.combined, features.select, cores = 10, assay = "RNA", cutoff = 0.05)
+genes.hypoxia <- extract_hypoxia(sample.combined, features.select, cores = 10, assay = "RNA", cutoff = 0.1)
+
+features.filtered <- setdiff(features.select, c(MT.genes, RPL.genes, RPS.genes, hgGenes, HIST.genes, igGenes, IG.genes, TRV.genes))
+
+sample.list <- purrr::map(sample.list, function(x) {
+  x <- ScaleData(x,
+    vars.to.regress = c("nFeature_RNA", "percent.mt", "G2M.Score", "S.Score", "Stress.Score1"),
+    features = features.filtered
+  )
+  x <- RunPCA(x, features = features.filtered, npcs = 30, verbose = FALSE)
+})
+
+
+plan("multiprocess", workers = 20)
+plan()
+options(future.globals.maxSize = 40 * 1024^3)
+# cell_number.min  <- sample.combined@meta.data %>%
+#   dplyr::group_by(Sample) %>%
+#   dplyr::summarise(num = n(), gene = mean(nFeature_RNA)) %>%
+#   dplyr::pull(num) %>%
+#   min()
+gc()
+plan()
+sample.anchors <- FindIntegrationAnchors(sample.list,
+  reduction = "rpca",
+  dims = 1:20,
+  anchor.features = features.filtered,
+  scale = FALSE
+)
+
+# sample.anchors <- FindIntegrationAnchors(sample.list,
+#                                          reduction = "cca",
+#                                          k.anchor = 5,
+#                                          k.filter = 200,
+#                                          reference = ref_ids,
+#                                          dims = 1:30,
+#                                          anchor.features = features.filtered,
+#                                          scale = FALSE)
+sample.integrated <- IntegrateData(anchorset = sample.anchors, dims = 1:20)
+
+sample.integrated <- AddModuleScore(
+  object = sample.integrated,
+  features = list(cc.genes$s.genes),
+  ctrl = length(cc.genes$s.genes),
+  name = "S.Score",
+  search = FALSE,
+  assay = "integrated"
+)
+sample.integrated <- AddModuleScore(
+  object = sample.integrated,
+  features = list(cc.genes$g2m.genes),
+  ctrl = length(cc.genes$g2m.genes),
+  name = "G2M.Score",
+  search = FALSE,
+  assay = "integrated"
+)
+
+sample.integrated <- FindVariableFeatures(
+  sample.integrated,
+  selection.method = "vst",
+  nfeatures = 3000, verbose = FALSE
+)
+
+var.features <- VariableFeatures(sample.integrated)
+# var.features  <- rownames(sample.integrated)
+plan()
+DefaultAssay(sample.integrated) <- "integrated"
+sample.integrated <- ScaleData(
+  sample.integrated,
+  # vars.to.regress = c("percent.mt","nFeature_RNA","G2M.Score1","S.Score1"),
+  features = rownames(sample.integrated)
+)
+
+genes.cc <- extract_cellcycle(sample.integrated, var.features, cores = 10, assay = "integrated", cutoff = 0.05)
+genes.stress <- extract_stress(sample.integrated, var.features, cores = 10, assay = "integrated", cutoff = 0.1)
+# genes.ifn <- extract_ifn(sample.integrated, var.features, cores = 10, assay = "integrated", cutoff = 0.1)
+genes.hypoxia <- extract_hypoxia(sample.integrated, var.features, cores = 10, assay = "integrated", cutoff = 0.1)
+
+var.features.filtered <- var.features[!var.features %in% c(genes.cc[1:90], genes.stress, genes.hypoxia[1:20])]
+sample.integrated <- RunPCA(sample.integrated, npcs = 30, features = var.features.filtered)
+sample.integrated <- RunUMAP(sample.integrated,
+  umap.method = "umap-learn",
+  reduction = "pca",
+  dims = 1:30
+)
+sample.integrated <- FindNeighbors(sample.integrated,
+  reduction = "pca",
+  dims = 1:30, force.recalc = T
+)
+sample.integrated <- FindClusters(sample.integrated,
+  algorithm = 1,
+  resolution = c(0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2, 2.5, 3)
+)
+
+
+head(sample.integrated@meta.data)
+pdf("../figures/umap_integrated_sap_pc30_metadata.pdf", width = 10, height = 8)
+DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "integrated_snn_res.0.1")
+DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "integrated_snn_res.0.2")
+DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "integrated_snn_res.0.4")
+DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "integrated_snn_res.0.8")
+DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "integrated_snn_res.1.2")
+DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "integrated_snn_res.1.6")
+DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "integrated_snn_res.2")
+DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "integrated_snn_res.2.5")
+DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "integrated_snn_res.3")
+DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "Patient")
+DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "Group")
+DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "Phase")
+DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "Cause")
+DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "scrublet_callrate")
+dev.off()
+
+Idents(sample.integrated) <- "Patient"
+DimPlot(object = sample.integrated, reduction = "umap", label = F, split.by = "Patient", ncol = 5)
+
+pdf("../figures/umap_integrated_sap_pc30_metadata.pdf", width = 10, height = 8)
+DimPlot(object = sample.integrated, reduction = "umap", label = T, group.by = "scrublet_callrate")
+dev.off()
+
+pdf("../figures/umap_integrated_sap_pc30_feature.pdf", width = 10, height = 10)
+DefaultAssay(sample.integrated) <- "RNA"
+FeaturePlot(
+  object = sample.integrated,
+  features = c("CD3D", "CD4", "CD8A", "SLC4A10"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+)
+FeaturePlot(
+  object = sample.integrated,
+  features = c("CCR7", "GZMA", "GZMK", "GZMB"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+)
+FeaturePlot(
+  object = sample.integrated,
+  features = c("JCHAIN", "CD1C", "PF4", "FOXP3"),
+  cols = c("grey", "blue"), pt.size = 0.1,
+  reduction = "umap"
+)
+FeaturePlot(
+  object = sample.integrated,
+  features = c("TRDC", "CLDN5", "PAX8", "MSLN"),
+  cols = c("grey", "blue"), pt.size = 0.1,
+  reduction = "umap"
+)
+
+FeaturePlot(
+  object = sample.integrated,
+  features = c("CD27", "CD19", "CD20", "CD22"),
+  cols = c("grey", "blue"), pt.size = 0.1,
+  reduction = "umap"
+)
+
+FeaturePlot(
+  object = sample.integrated,
+  features = c("CD79A", "TCL1A", "IGHA1", "MZB1"),
+  cols = c("grey", "blue"), pt.size = 0.1,
+  reduction = "umap"
+)
+FeaturePlot(
+  object = sample.integrated,
+  features = c("ACTA2", "RGS5", "MYH11", "BGN"),
+  cols = c("grey", "blue"), pt.size = 0.1,
+  reduction = "umap"
+)
+FeaturePlot(
+  object = sample.integrated,
+  features = c("CNN1", "MYH9", "ACTG2", "MYLK"),
+  cols = c("grey", "blue"), pt.size = 0.1,
+  reduction = "umap"
+)
+FeaturePlot(
+  object = sample.integrated,
+  features = c("CD27", "IGHG1", "IGHM", "IGHD"),
+  cols = c("grey", "blue"), pt.size = 0.1,
+  reduction = "umap"
+)
+
+FeaturePlot(
+  object = sample.integrated,
+  features = c("CD14", "FCGR3A", "FCGR3B", "FCN1"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+)
+
+FeaturePlot(
+  object = sample.integrated,
+  features = c("CD68", "CD34", "CFP", "STAB1"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+)
+
+FeaturePlot(
+  object = sample.integrated,
+  features = c("MS4A2", "TTC28", "BNC2", "PROX1"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+)
+FeaturePlot(
+  object = sample.integrated,
+  features = c("ACRK1", "CA4", "LILRA4", "IL1B"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+)
+FeaturePlot(
+  object = sample.integrated,
+  features = c("EPCAM", "KRT7", "CD24", "KRT17"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+)
+FeaturePlot(
+  object = sample.integrated,
+  features = c("C1QC", "CSF3R", "MS4A7", "C3"),
+  cols = c("grey", "blue"), pt.size = 0.1, reduction = "umap"
+)
+FeaturePlot(
+  object = sample.integrated,
+  features = c("nFeature_RNA", "nCount_RNA", "MKI67", "G2M.Score"),
+  cols = c("grey", "blue"), pt.size = 0.1,
+  reduction = "umap"
+)
+DefaultAssay(sample.integrated) <- "integrated"
+dev.off()
+
+saveRDS(sample.integrated, "../analysis/sample_integrated_sap_pc30.rds")
+
+sample.integrated@meta.data %>%
+  dplyr::group_by(integrated_snn_res.0.8) %>%
+  dplyr::summarise(num = n(), gene = mean(nFeature_RNA), umi = mean(nCount_RNA))
+
+DefaultAssay(sample.integrated) <- "RNA"
+Idents(sample.integrated) <- "integrated_snn_res.1.6"
+markers.all <- FindAllMarkers(sample.integrated, logfc.threshold = log(2))
+write.xlsx(markers.all, file = "../data/sample_integrated_markers_all.xlsx")
+```
+
+
+
